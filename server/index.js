@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const https = require("https");
 let nodemailer;
 try {
   nodemailer = require("nodemailer");
@@ -71,6 +72,14 @@ const EMAIL_ENABLED = Boolean(
     EMAIL_CONFIG.pass
 );
 let emailTransporterWarningLogged = false;
+const FX_RATE_PROVIDER_URLS = [
+  "https://api.frankfurter.app/latest?from={from}&to={to}",
+  "https://api.exchangerate.host/convert?from={from}&to={to}&amount=1",
+  "https://open.er-api.com/v6/latest/{from}",
+];
+const FX_RATE_CACHE_TTL_MS = 30_000;
+const FX_RATE_PROVIDER_TIMEOUT_MS = 6_000;
+const fxRateCache = {};
 
 const app = express();
 let db = null;
@@ -87,6 +96,8 @@ const defaultState = {
       name: "Cityline Bank 관리자",
       pin: "0000",
       email: "admin@cityline-bank.local",
+      postcode: null,
+      address: null,
       balance: 0,
       frozen: false,
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -97,6 +108,8 @@ const defaultState = {
       name: "김하늘",
       pin: "1234",
       email: "customer1@cityline-bank.local",
+      postcode: null,
+      address: null,
       balance: 120000,
       frozen: false,
       createdAt: "2026-01-05T00:00:00.000Z",
@@ -107,6 +120,8 @@ const defaultState = {
       name: "박소윤",
       pin: "4321",
       email: "customer2@cityline-bank.local",
+      postcode: null,
+      address: null,
       balance: 76000,
       frozen: false,
       createdAt: "2026-01-06T00:00:00.000Z",
@@ -334,7 +349,12 @@ function loadState() {
     const state = clone(defaultState);
     state.config = { ...defaultState.config, ...(parsed.config || {}) };
     state.accounts = Array.isArray(parsed.accounts)
-      ? parsed.accounts.map((account) => ({ ...account, email: account.email || null }))
+      ? parsed.accounts.map((account) => ({
+          ...account,
+          email: account.email || null,
+          postcode: account.postcode || null,
+          address: account.address || null,
+        }))
       : state.accounts;
     state.nextSeq = Number.isFinite(parsed.nextSeq) ? parsed.nextSeq : state.nextSeq;
     state.sessions = {};
@@ -357,6 +377,8 @@ function publicAccount(account) {
     name: account.name,
     balance: account.balance,
     email: account.email || null,
+    postcode: account.postcode || null,
+    address: account.address || null,
     frozen: account.frozen,
     createdAt: account.createdAt,
   };
@@ -456,6 +478,8 @@ async function initDb() {
       login_id VARCHAR(64) NOT NULL UNIQUE,
       name VARCHAR(80) NOT NULL,
       email VARCHAR(255) NULL,
+      postcode VARCHAR(20) NULL,
+      address VARCHAR(255) NULL,
       pin_hash VARBINARY(128) NOT NULL,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -534,6 +558,16 @@ async function initDb() {
       await conn.query("ALTER TABLE users ADD COLUMN email VARCHAR(255) NULL");
     }
 
+    const [postcodeColumns] = await conn.query("SHOW COLUMNS FROM users LIKE 'postcode'");
+    if (!postcodeColumns.length) {
+      await conn.query("ALTER TABLE users ADD COLUMN postcode VARCHAR(20) NULL");
+    }
+
+    const [addressColumns] = await conn.query("SHOW COLUMNS FROM users LIKE 'address'");
+    if (!addressColumns.length) {
+      await conn.query("ALTER TABLE users ADD COLUMN address VARCHAR(255) NULL");
+    }
+
     const [txnTypeColumns] = await conn.query("SHOW COLUMNS FROM transactions LIKE 'type'");
     const txnTypeColumn = String(txnTypeColumns[0]?.Type || "");
     if (!txnTypeColumn.includes("ADMIN_EMAIL_UPDATE")) {
@@ -585,12 +619,14 @@ async function ensureDbAccount(accountNo) {
   }
 
   await query(
-    "INSERT INTO users (role, login_id, name, email, pin_hash) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), role = VALUES(role), updated_at = CURRENT_TIMESTAMP(6)",
+    "INSERT INTO users (role, login_id, name, email, postcode, address, pin_hash) VALUES (?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), postcode = VALUES(postcode), address = VALUES(address), role = VALUES(role), updated_at = CURRENT_TIMESTAMP(6)",
     [
       account.role === "admin" ? "admin" : "customer",
       accountNo,
       account.name,
       account.email || null,
+      account.postcode || null,
+      account.address || null,
       hashPin(account.pin || "0000"),
     ]
   );
@@ -824,6 +860,182 @@ function logDbError(res, error, fallbackStatus = 500) {
   return res.status(fallbackStatus).json({ error: "DB_ERROR", message: error.message });
 }
 
+function normalizeFxCurrency(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase();
+}
+
+function getFxCacheKey(from, to) {
+  return `${from}_${to}`;
+}
+
+function getCachedFxRate({ from, to }) {
+  return fxRateCache[getFxCacheKey(from, to)] || null;
+}
+
+function setCachedFxRate({ from, to, rate, source }) {
+  const now = Date.now();
+  const key = getFxCacheKey(from, to);
+  fxRateCache[key] = {
+    rate,
+    source,
+    updatedAt: now,
+    fetchedAt: new Date(now).toISOString(),
+  };
+}
+
+function buildFxUrls(from, to) {
+  return FX_RATE_PROVIDER_URLS.map((template) =>
+    template.replaceAll("{from}", encodeURIComponent(from)).replaceAll("{to}", encodeURIComponent(to))
+  );
+}
+
+function fetchFxJson(url, timeoutMs = FX_RATE_PROVIDER_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, (response) => {
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        response.resume();
+        reject(new Error(`HTTP ${response.statusCode}`));
+        return;
+      }
+
+      const chunks = [];
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        try {
+          const json = JSON.parse(chunks.join(""));
+          resolve(json);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    request.on("timeout", () => {
+      request.destroy(new Error("FX API timeout"));
+    });
+    request.on("error", (error) => {
+      reject(error);
+    });
+    request.setTimeout(timeoutMs);
+  });
+}
+
+function parseFxRate(data, to) {
+  if (data?.rates && typeof data.rates[to] === "number") {
+    return { rate: data.rates[to], source: "rates" };
+  }
+  if (typeof data?.result === "number") {
+    return { rate: data.result, source: "result" };
+  }
+  return null;
+}
+
+async function fetchFxRatePair({ from, to }) {
+  const providerUrls = buildFxUrls(from, to);
+  for (const sourceUrl of providerUrls) {
+    try {
+      const provider = new URL(sourceUrl).hostname;
+      const payload = await fetchFxJson(sourceUrl);
+      const parsed = parseFxRate(payload, to);
+      if (parsed && Number.isFinite(parsed.rate) && parsed.rate > 0) {
+        return { rate: parsed.rate, source: `${provider} (${parsed.source})` };
+      }
+    } catch (error) {
+      console.warn("환율 조회 실패(현재 소스):", sourceUrl, error.message);
+    }
+  }
+  throw new Error("모든 환율 제공자 응답 실패");
+}
+
+function formatFxPair(from, to) {
+  return `${from}_${to}`;
+}
+
+async function handleFxRateRequest(req, res) {
+  const from = normalizeFxCurrency(req.query.from || "USD");
+  const to = normalizeFxCurrency(req.query.to || "KRW");
+  const pair = formatFxPair(from, to);
+
+  if (!/^[A-Z]{3}$/.test(from) || !/^[A-Z]{3}$/.test(to)) {
+    return res.status(400).json({ error: "BAD_CURRENCY" });
+  }
+
+  if (from === to) {
+    return res.json({
+      pair,
+      from,
+      to,
+      rate: 1,
+      source: "system",
+      fetchedAt: new Date().toISOString(),
+      cached: true,
+      stale: false,
+    });
+  }
+
+  const now = Date.now();
+  const cached = getCachedFxRate({ from, to });
+  const isCachedFresh = Boolean(cached && now - cached.updatedAt < FX_RATE_CACHE_TTL_MS);
+  if (isCachedFresh) {
+    return res.json({
+      pair,
+      from,
+      to,
+      rate: cached.rate,
+      source: cached.source,
+      fetchedAt: cached.fetchedAt,
+      cached: true,
+      stale: false,
+    });
+  }
+
+  try {
+    const { rate, source } = await fetchFxRatePair({ from, to });
+    setCachedFxRate({ from, to, rate, source });
+    return res.json({
+      pair,
+      from,
+      to,
+      rate,
+      source,
+      fetchedAt: fxRateCache[pair]?.fetchedAt,
+      cached: false,
+      stale: false,
+    });
+  } catch (error) {
+    if (cached) {
+      return res.json({
+        pair,
+        from,
+        to,
+        rate: cached.rate,
+        source: cached.source,
+        fetchedAt: cached.fetchedAt,
+        cached: true,
+        stale: true,
+        error: "FX_RATE_FETCH_FAILED_BUT_CACHED_VALUE",
+      });
+    }
+
+    console.error("백엔드 환율 조회 실패:", error.message);
+    return res.status(502).json({
+      error: "FX_RATE_FETCH_ERROR",
+      message: "환율 조회에 실패했습니다.",
+      source: "proxy",
+    });
+  }
+}
+
+app.get("/api/fx", handleFxRateRequest);
+app.get("/api/fx/usd-krw", (req, res) => {
+  req.query.from = req.query.from || "USD";
+  req.query.to = req.query.to || "KRW";
+  return handleFxRateRequest(req, res);
+});
+
 app.get("/api/health", async (_, res) => {
   try {
     await query("SELECT 1");
@@ -883,10 +1095,16 @@ app.patch("/api/me", requireAuth, async (req, res) => {
 
   const hasName = Object.prototype.hasOwnProperty.call(body, "name");
   const hasEmail = Object.prototype.hasOwnProperty.call(body, "email");
+  const hasPostcode = Object.prototype.hasOwnProperty.call(body, "postcode");
+  const hasAddress = Object.prototype.hasOwnProperty.call(body, "address");
   const hasNewPin = Object.prototype.hasOwnProperty.call(body, "newPin");
   const nextName = hasName ? String(body.name || "").trim() : account.name;
   const normalizedEmail = hasEmail ? String(body.email || "").trim() : (account.email || "");
   const nextEmail = hasEmail ? (normalizedEmail || null) : account.email;
+  const normalizedPostcode = hasPostcode ? String(body.postcode || "").trim() : (account.postcode || null);
+  const nextPostcode = hasPostcode ? (normalizedPostcode || null) : account.postcode;
+  const normalizedAddress = hasAddress ? String(body.address || "").trim() : (account.address || "");
+  const nextAddress = hasAddress ? (normalizedAddress || null) : account.address;
   const nextPin = hasNewPin ? String(body.newPin || "").trim() : account.pin;
 
   if (hasName && !nextName) {
@@ -895,32 +1113,43 @@ app.patch("/api/me", requireAuth, async (req, res) => {
   if (hasEmail && nextEmail && !isValidEmail(nextEmail)) {
     return res.status(400).json({ error: "BAD_EMAIL" });
   }
+  if (hasPostcode && nextPostcode && !/^[0-9-]+$/.test(nextPostcode)) {
+    return res.status(400).json({ error: "BAD_POSTCODE" });
+  }
+  if (hasAddress && nextAddress && nextAddress.length > 255) {
+    return res.status(400).json({ error: "BAD_ADDRESS" });
+  }
   if (hasNewPin && !isValidPin(nextPin)) {
     return res.status(400).json({ error: "BAD_PIN" });
   }
 
-  const changed = (hasName && nextName !== account.name) || (hasEmail && nextEmail !== account.email) || (hasNewPin && nextPin !== account.pin);
+  const changed =
+    (hasName && nextName !== account.name) ||
+    (hasEmail && nextEmail !== account.email) ||
+    (hasPostcode && nextPostcode !== account.postcode) ||
+    (hasAddress && nextAddress !== account.address) ||
+    (hasNewPin && nextPin !== account.pin);
   if (!changed) {
     return res.json({ account: publicAccount(account), updated: false, transaction: null });
   }
 
   const previousName = account.name;
   const previousEmail = account.email;
+  const previousPostcode = account.postcode;
+  const previousAddress = account.address;
   const previousPin = account.pin;
   account.name = nextName;
   account.email = nextEmail;
+  account.postcode = nextPostcode;
+  account.address = nextAddress;
   account.pin = nextPin;
-
-  const setTokens = ["name = ?", "email = ?", "updated_at = CURRENT_TIMESTAMP(6)"];
-  const params = [account.name, account.email];
-  if (hasNewPin) {
-    setTokens.splice(2, 0, "pin_hash = ?");
-    params.push(hashPin(account.pin));
-  }
 
   try {
     await ensureDbAccount(account.accountNo);
-    await query(`UPDATE users SET ${setTokens.join(", ")} WHERE login_id = ?`, [...params, account.accountNo]);
+    await query(
+      "UPDATE users SET name = ?, email = ?, postcode = ?, address = ?, pin_hash = ?, updated_at = CURRENT_TIMESTAMP(6) WHERE login_id = ?",
+      [account.name, account.email, account.postcode, account.address, hashPin(account.pin), account.accountNo]
+    );
 
     let txn = null;
     if (hasEmail && previousEmail !== nextEmail) {
@@ -940,13 +1169,13 @@ app.patch("/api/me", requireAuth, async (req, res) => {
   } catch (error) {
     account.name = previousName;
     account.email = previousEmail;
+    account.postcode = previousPostcode;
+    account.address = previousAddress;
     account.pin = previousPin;
-    await query("UPDATE users SET name = ?, email = ?, pin_hash = ?, updated_at = CURRENT_TIMESTAMP(6) WHERE login_id = ?", [
-      previousName,
-      previousEmail,
-      hashPin(previousPin || "0000"),
-      account.accountNo,
-    ]).catch(() => {});
+    await query(
+      "UPDATE users SET name = ?, email = ?, postcode = ?, address = ?, pin_hash = ?, updated_at = CURRENT_TIMESTAMP(6) WHERE login_id = ?",
+      [previousName, previousEmail, previousPostcode, previousAddress, hashPin(previousPin || "0000"), account.accountNo]
+    ).catch(() => {});
     return logDbError(res, error, 500);
   }
 });
@@ -1130,6 +1359,8 @@ app.post("/api/admin/accounts", requireAuth, requireAdmin, async (req, res) => {
   const name = String(req.body.name || "").trim();
   const pin = String(req.body.pin || "");
   const email = String(req.body.email || "").trim();
+  const postcode = String(req.body.postcode || "").trim();
+  const address = String(req.body.address || "").trim();
   const initialBalance = Number(req.body.initialBalance || 0);
 
   if (!name) {
@@ -1152,6 +1383,8 @@ app.post("/api/admin/accounts", requireAuth, requireAdmin, async (req, res) => {
     name,
     pin,
     email: email || null,
+    postcode: postcode || null,
+    address: address || null,
     balance: initialBalance,
     frozen: false,
     createdAt: now(),

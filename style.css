@@ -41,21 +41,102 @@ body {
   border: 1px solid var(--card-border);
   border-radius: 18px;
   padding: 1rem 1.5rem;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: 1rem;
 }
 
-.topbar h1 {
+.topbar-brand h1 {
   font-size: 1.6rem;
   margin: 0;
   letter-spacing: 0.04em;
 }
 
-.topbar p {
+.topbar-brand p {
   margin: 0;
-  margin-left: auto;
   color: var(--muted);
+}
+
+.fx-ticker {
+  text-align: right;
+  white-space: nowrap;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 0.45rem 0.6rem;
+  background: rgba(8, 13, 25, 0.45);
+}
+
+.fx-ticker-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.55rem;
+}
+
+.fx-rate {
+  display: block;
+  color: #dff5e9;
+}
+
+.fx-updated {
+  display: block;
+  margin-top: 0.08rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.fx-error {
+  color: var(--danger);
+}
+
+.fx-stale {
+  color: var(--warn);
+}
+
+.fx-refresh-btn {
+  margin-top: 0;
+  width: auto;
+  padding: 0.35rem 0.7rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  transition: opacity 180ms ease;
+}
+
+.fx-refresh-label {
+  margin-top: 0.02rem;
+  color: var(--text);
+  transition: color 180ms ease;
+}
+
+.fx-refresh-icon {
+  display: inline-block;
+  line-height: 1;
+  transition: transform 180ms ease;
+  transform-origin: center;
+}
+
+.fx-refresh-btn.is-refreshing .fx-refresh-icon {
+  animation: fx-refresh-spin 0.75s linear infinite;
+}
+
+.fx-refresh-btn.is-refreshing .fx-refresh-label {
+  color: var(--accent);
+}
+
+.fx-refresh-btn:disabled .fx-refresh-label {
+  color: rgba(233, 238, 251, 0.72);
+}
+
+@keyframes fx-refresh-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .main-shell {
@@ -158,6 +239,17 @@ button {
   display: grid;
   gap: 0.5rem;
   grid-template-columns: 1fr 1fr 1fr;
+}
+
+.address-row {
+  display: grid;
+  grid-template-columns: 1fr 140px;
+  gap: 0.5rem;
+  align-items: end;
+}
+
+.address-row button {
+  margin-top: 0;
 }
 
 .stats {
@@ -332,7 +424,13 @@ tbody td {
     display: block;
   }
 
-  .topbar p {
+  .topbar p,
+  .fx-ticker {
+    text-align: left;
     margin: 0.2rem 0 0;
+  }
+
+  .fx-ticker-row {
+    justify-content: flex-start;
   }
 }

@@ -25,6 +25,78 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
+  /api/fx:
+    get:
+      summary: 환율 조회 (백엔드 프록시)
+      description: |
+        외부 환율 API를 백엔드에서 중계합니다.
+        from/to 파라미터 미지정 시 USD/KRW를 조회합니다.
+      tags:
+        - Exchange
+      security: []
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: "^[A-Z]{3}$"
+            default: USD
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+            pattern: "^[A-Z]{3}$"
+            default: KRW
+      responses:
+        "200":
+          description: 환율 조회 성공
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FxRateResponse"
+              example:
+                pair: USD_KRW
+                from: USD
+                to: KRW
+                rate: 1387.25
+                source: api.frankfurter.app (rates)
+                fetchedAt: "2026-02-28T12:34:56.789Z"
+                cached: false
+                stale: false
+        "400":
+          description: 잘못된 통화코드
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "BAD_CURRENCY"
+        "502":
+          description: 환율 조회 실패
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "FX_RATE_FETCH_ERROR"
+                message: 환율 조회에 실패했습니다.
+
+  /api/fx/usd-krw:
+    get:
+      summary: USD/KRW 환율 조회 (레거시 호환)
+      tags:
+        - Exchange
+      security: []
+      responses:
+        "200":
+          description: 환율 조회 성공
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FxRateResponse"
+
   /api/login:
     post:
       summary: 로그인
@@ -944,3 +1016,38 @@ components:
         reason:
           type: string
           maxLength: 255
+
+    FxRateResponse:
+      type: object
+      required:
+        - pair
+        - from
+        - to
+        - rate
+        - source
+      properties:
+        pair:
+          type: string
+          example: USD_KRW
+        from:
+          type: string
+          example: USD
+        to:
+          type: string
+          example: KRW
+        rate:
+          type: number
+          format: double
+          example: 1387.25
+        source:
+          type: string
+          example: api.frankfurter.app (rates)
+        fetchedAt:
+          type: string
+          format: date-time
+        cached:
+          type: boolean
+          example: false
+        stale:
+          type: boolean
+          example: false

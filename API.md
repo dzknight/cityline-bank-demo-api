@@ -113,6 +113,36 @@
 { "approvalThreshold": 100000 }
 ```
 
+### 5.4 `GET /api/fx`
+- 설명: 환율 조회 프록시(운영용)
+- 인증 불필요
+- Query
+  - `from` (optional): 통화 코드 3자리, 기본값 `USD`
+  - `to` (optional): 통화 코드 3자리, 기본값 `KRW`
+- Success `200`
+```json
+{
+  "pair": "USD_KRW",
+  "from": "USD",
+  "to": "KRW",
+  "rate": 1387.25,
+  "source": "api.frankfurter.app (rates)",
+  "fetchedAt": "2026-02-28T12:34:56.789Z",
+  "cached": false,
+  "stale": false
+}
+```
+- 비고
+  - 환율 조회 실패 시 캐시값이 있으면 `cached: true`, `stale: true`로 응답합니다.
+- Error
+  - `400` `BAD_CURRENCY`
+  - `502` `FX_RATE_FETCH_ERROR`
+
+### 5.5 `GET /api/fx/usd-krw`
+- 설명: 레거시 호환 USD/KRW 전용 엔드포인트
+- 인증 불필요
+- Success는 5.4와 동일한 스키마를 반환합니다.
+
 ## 6) 거래 조회
 
 ### 6.1 `GET /api/transactions`
@@ -290,6 +320,7 @@
 
 - 인증/권한: `AUTH_TOKEN_REQUIRED`(401), `FORBIDDEN`(403)
 - 유효성: `BAD_AMOUNT`, `BAD_PIN`, `BAD_INITIAL_BALANCE`, `RECEIVER_REQUIRED`
+- 환율: `BAD_CURRENCY`, `FX_RATE_FETCH_ERROR`
 - 상태전이: `TRANSACTION_NOT_PENDING`, `TRANSACTION_STATE_CHANGED`
 - 계좌 상태: `ACCOUNT_FROZEN`, `CANNOT_MODIFY_ADMIN_ACCOUNT`
 - 거래 상태: `INSUFFICIENT_FUNDS`, `RECEIVER_NOT_FOUND`, `SELF_TRANSFER_NOT_ALLOWED`, `REJECTED`, `FAILED`
@@ -315,6 +346,11 @@ curl -X POST http://localhost:4000/api/transfer \
   -H "Content-Type: application/json" \
   -H "x-auth-token: <TOKEN>" \
   -d '{ "toAccountNo":"1000002", "amount": 50000, "memo":"이체 1000002" }'
+```
+
+- 환율 조회 (USD→KRW)
+```bash
+curl "http://localhost:4000/api/fx?from=USD&to=KRW"
 ```
 
 ## 11) 참고

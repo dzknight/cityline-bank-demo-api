@@ -9,8 +9,20 @@
 <body>
   <div id="app">
     <header class="topbar">
-      <h1>Cityline Bank 시스템</h1>
-      <p>실전형 은행 운영 시뮬레이터</p>
+      <div class="topbar-brand">
+        <h1>Cityline Bank 시스템</h1>
+        <p>실전형 은행 운영 시뮬레이터</p>
+      </div>
+      <div id="fxTicker" class="fx-ticker">
+        <div class="fx-ticker-row">
+          <span id="fxRate" class="fx-rate">환율 정보를 불러오는 중...</span>
+          <button id="fxRefreshBtn" class="ghost-btn fx-refresh-btn" type="button" title="마지막 갱신: 없음">
+            <span class="fx-refresh-icon" aria-hidden="true">↻</span>
+            <span class="fx-refresh-label">새로고침</span>
+          </button>
+        </div>
+        <span id="fxUpdated" class="fx-updated"></span>
+      </div>
       <p id="sessionInfo" class="hint">로그인 필요</p>
       <button id="logoutBtn" class="ghost-btn" disabled>로그아웃</button>
     </header>
@@ -38,13 +50,22 @@
         <p class="hint">초기 관리자 계정: ID <strong>ADMIN</strong> / PIN <strong>0000</strong></p>
       </section>
 
-      <section id="profileSection" class="card hidden">
+       <section id="profileSection" class="card hidden">
         <h2>내 정보 수정</h2>
         <p id="profileAccount" class="hint">로그인 후 이용 가능합니다.</p>
         <label for="profileName">예금주명</label>
         <input id="profileName" type="text" placeholder="이름" />
         <label for="profileEmail">이메일</label>
         <input id="profileEmail" type="email" placeholder="user@cityline.co.kr" />
+        <label for="profilePostcode">우편번호</label>
+        <div class="address-row">
+          <div>
+            <input id="profilePostcode" type="text" placeholder="우편번호" maxlength="10" />
+          </div>
+          <button id="profileAddressSearchBtn" type="button" class="ghost-btn">주소 검색</button>
+        </div>
+        <label for="profileAddress">주소</label>
+        <input id="profileAddress" type="text" placeholder="주소" />
         <label for="profileCurrentPin">현재 PIN</label>
         <input id="profileCurrentPin" type="password" placeholder="변경/수정 확인용 PIN" />
         <label for="profileNewPin">새 PIN(선택)</label>
@@ -145,6 +166,15 @@
             <input id="newPin" type="password" placeholder="숫자 4~8자리" maxlength="8" />
             <label for="newEmail">이메일</label>
             <input id="newEmail" type="email" placeholder="customer@company.com" />
+            <label for="newPostcode">우편번호</label>
+            <div class="address-row">
+              <div>
+                <input id="newPostcode" type="text" placeholder="우편번호" maxlength="10" />
+              </div>
+              <button id="newAddressSearchBtn" type="button" class="ghost-btn">주소 검색</button>
+            </div>
+            <label for="newAddress">주소</label>
+            <input id="newAddress" type="text" placeholder="주소" />
             <label for="initialBalance">초기 입금</label>
             <input id="initialBalance" type="number" min="0" step="1" placeholder="0" />
             <button id="createAccountBtn" class="btn-primary">계좌 생성</button>
@@ -184,8 +214,9 @@
       </section>
     </main>
   </div>
-
+ 
   <div id="toast" class="toast hidden"></div>
+  <script src="https://t1.daumcdn.net/mapjsapi/bundle/postcode/prod/postcode.v2.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

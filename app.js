@@ -3,6 +3,8 @@ const API_BASE =
     ? "http://localhost:4000/api"
     : `${window.location.origin}/api`;
 const AUTH_STORAGE_KEY = "cityline_bank_session_v2";
+const FX_TICKER_INTERVAL_MS = 60_000;
+const FX_TICKER_ENDPOINT = "/fx?from=USD&to=KRW";
 
 const state = {
   token: localStorage.getItem(AUTH_STORAGE_KEY),
@@ -13,6 +15,10 @@ const state = {
   pendingApprovals: [],
   selectedAccountNo: null,
 };
+let fxTickerTimer = null;
+let isFxRefreshing = false;
+let fxLastUpdatedAt = null;
+let fxLastUpdateStatus = "갱신 대기 중";
 
 const el = {
   loginSection: document.getElementById("loginSection"),
@@ -29,9 +35,18 @@ const el = {
   profileAccount: document.getElementById("profileAccount"),
   profileName: document.getElementById("profileName"),
   profileEmail: document.getElementById("profileEmail"),
+  profilePostcode: document.getElementById("profilePostcode"),
+  profileAddress: document.getElementById("profileAddress"),
+  profileAddressSearchBtn: document.getElementById("profileAddressSearchBtn"),
   profileCurrentPin: document.getElementById("profileCurrentPin"),
   profileNewPin: document.getElementById("profileNewPin"),
   updateProfileBtn: document.getElementById("updateProfileBtn"),
+  fxTicker: document.getElementById("fxTicker"),
+  fxRate: document.getElementById("fxRate"),
+  fxUpdated: document.getElementById("fxUpdated"),
+  fxRefreshBtn: document.getElementById("fxRefreshBtn"),
+  fxRefreshLabel: document.querySelector("#fxRefreshBtn .fx-refresh-label"),
+  fxRefreshIcon: document.querySelector("#fxRefreshBtn .fx-refresh-icon"),
   custName: document.getElementById("custName"),
   custNo: document.getElementById("custNo"),
   custBalance: document.getElementById("custBalance"),
@@ -58,6 +73,9 @@ const el = {
   newName: document.getElementById("newName"),
   newPin: document.getElementById("newPin"),
   newEmail: document.getElementById("newEmail"),
+  newPostcode: document.getElementById("newPostcode"),
+  newAddress: document.getElementById("newAddress"),
+  newAddressSearchBtn: document.getElementById("newAddressSearchBtn"),
   initialBalance: document.getElementById("initialBalance"),
   createAccountBtn: document.getElementById("createAccountBtn"),
   selectedAccount: document.getElementById("selectedAccount"),
@@ -74,6 +92,14 @@ function money(num) {
     style: "currency",
     currency: "KRW",
   }).format(Math.round(num || 0));
+}
+
+function fxMoney(num) {
+  return new Intl.NumberFormat("ko-KR", {
+    style: "currency",
+    currency: "KRW",
+    maximumFractionDigits: 2,
+  }).format(Number.isFinite(num) ? num : 0);
 }
 
 function formatDateTime(value) {
@@ -96,11 +122,15 @@ function clearInputs() {
   el.transferAmount.value = "";
   el.profileName.value = "";
   el.profileEmail.value = "";
+  el.profilePostcode.value = "";
+  el.profileAddress.value = "";
   el.profileCurrentPin.value = "";
   el.profileNewPin.value = "";
   el.newName.value = "";
   el.newPin.value = "";
   el.newEmail.value = "";
+  el.newPostcode.value = "";
+  el.newAddress.value = "";
   el.initialBalance.value = "";
   el.targetEmail.value = "";
   el.targetAmount.value = "";
@@ -218,6 +248,8 @@ function renderProfilePanel() {
   el.profileAccount.textContent = `${state.me.name} (${state.me.accountNo})`;
   el.profileName.value = state.me.name || "";
   el.profileEmail.value = state.me.email || "";
+  el.profilePostcode.value = state.me.postcode || "";
+  el.profileAddress.value = state.me.address || "";
   el.profileCurrentPin.value = "";
   el.profileNewPin.value = "";
 }
@@ -240,6 +272,117 @@ function parseAdjustAmount(value) {
 
 function isValidEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function openDaumPostcode({ postcodeInput, addressInput }) {
+  if (!window.daum || typeof window.daum.Postcode !== "function") {
+    throw new Error("우편번호 검색 API 스크립트가 로드되지 않았습니다.");
+  }
+
+  new window.daum.Postcode({
+    oncomplete: (data) => {
+      postcodeInput.value = data.zonecode || "";
+      addressInput.value = data.roadAddress || data.jibunAddress || data.address || "";
+    },
+  }).open();
+}
+
+async function fetchUsdToKrwRate() {
+  const response = await fetch(`${API_BASE}${FX_TICKER_ENDPOINT}`, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`환율 API 응답 실패 (${response.status})`);
+  }
+  const data = await response.json();
+  if (!Number.isFinite(Number(data.rate))) {
+    throw new Error("환율 데이터 형식이 올바르지 않습니다.");
+  }
+  return {
+    rate: Number(data.rate),
+    source: data.source || "internal",
+    fetchedAt: data.fetchedAt || null,
+    cached: Boolean(data.cached),
+    stale: Boolean(data.stale),
+  };
+}
+
+async function refreshFxTicker() {
+  if (!el.fxRate) return;
+  if (isFxRefreshing) return;
+  isFxRefreshing = true;
+  if (el.fxRefreshBtn) {
+    el.fxRefreshBtn.disabled = true;
+    el.fxRefreshBtn.classList.add("is-refreshing");
+    el.fxRefreshBtn.title = "환율 조회중...";
+  }
+  if (el.fxRefreshLabel) {
+    el.fxRefreshLabel.textContent = "조회중...";
+  }
+  try {
+    const { rate, source, fetchedAt, cached, stale } = await fetchUsdToKrwRate();
+    const numericRate = Number(rate);
+    if (!Number.isFinite(numericRate) || numericRate <= 0) {
+      throw new Error("환율 데이터가 유효하지 않습니다.");
+    }
+
+    const suffix = stale ? " (임시)" : " (매매)";
+    el.fxRate.textContent = `USD/KRW : ${fxMoney(numericRate)}${suffix}`;
+    el.fxRate.classList.remove("fx-error", "fx-stale");
+    if (stale) el.fxRate.classList.add("fx-stale");
+
+    const updatedText = fetchedAt ? new Date(fetchedAt).toLocaleString("ko-KR") : new Date().toLocaleString("ko-KR");
+    const statusText = stale ? "캐시(실시간 조회 실패)" : cached ? "캐시" : "실시간";
+    fxLastUpdatedAt = updatedText;
+    fxLastUpdateStatus = statusText;
+    if (el.fxUpdated) {
+      el.fxUpdated.textContent = `${updatedText} · ${source} · ${statusText}`;
+    }
+    const tooltipText = `마지막 갱신: ${updatedText}\n출처: ${source}\n상태: ${statusText}`;
+    if (el.fxRefreshBtn) {
+      el.fxRefreshBtn.title = tooltipText;
+    }
+    if (el.fxTicker) {
+      el.fxTicker.title = tooltipText;
+    }
+  } catch (error) {
+    el.fxRate.textContent = "USD/KRW: 조회 실패";
+    el.fxRate.classList.add("fx-error");
+    if (el.fxUpdated) {
+      const failedAt = new Date().toLocaleTimeString("ko-KR");
+      const recentText = fxLastUpdatedAt || failedAt;
+      const statusText = fxLastUpdatedAt ? "최근 성공 갱신값 사용 중" : "갱신 실패";
+      el.fxUpdated.textContent = `마지막 실패: ${failedAt} · ${statusText}`;
+      const tooltipText = `마지막 갱신: ${recentText}\n현재 상태: ${statusText}`;
+      if (el.fxRefreshBtn) {
+        el.fxRefreshBtn.title = tooltipText;
+      }
+      if (el.fxTicker) {
+        el.fxTicker.title = tooltipText;
+      }
+    }
+    console.error("환율 조회 실패:", error.message);
+  } finally {
+    isFxRefreshing = false;
+    if (el.fxRefreshBtn) {
+      el.fxRefreshBtn.disabled = false;
+      el.fxRefreshBtn.classList.remove("is-refreshing");
+      if (fxLastUpdatedAt) {
+        el.fxRefreshBtn.title = `마지막 갱신: ${fxLastUpdatedAt}\n상태: ${fxLastUpdateStatus}`;
+      } else {
+        el.fxRefreshBtn.title = "마지막 갱신: 없음";
+      }
+    }
+    if (el.fxRefreshLabel) {
+      el.fxRefreshLabel.textContent = "새로고침";
+    }
+  }
+}
+
+function startFxTicker() {
+  if (fxTickerTimer) clearInterval(fxTickerTimer);
+  void refreshFxTicker();
+  fxTickerTimer = setInterval(() => {
+    if (!document.hidden) void refreshFxTicker();
+  }, FX_TICKER_INTERVAL_MS);
 }
 
 async function restoreSession() {
@@ -522,6 +665,8 @@ async function createAccount() {
   const name = el.newName.value.trim();
   const pin = el.newPin.value.trim();
   const email = el.newEmail.value.trim();
+  const postcode = el.newPostcode.value.trim();
+  const address = el.newAddress.value.trim();
   const initialBalance = Number(el.initialBalance.value || 0);
   if (!name) throw new Error("예금주명을 입력하세요.");
   if (!/^[0-9]{4,8}$/.test(pin)) throw new Error("PIN은 숫자 4~8자리여야 합니다.");
@@ -531,7 +676,7 @@ async function createAccount() {
   if (email && !isValidEmail(email)) throw new Error("이메일 형식이 올바르지 않습니다.");
   const created = await api("/admin/accounts", {
     method: "POST",
-    body: { name, pin, email: email || null, initialBalance },
+    body: { name, pin, email: email || null, postcode, address, initialBalance },
   });
   await render();
   clearInputs();
@@ -609,15 +754,19 @@ async function updateProfile() {
   const currentPin = el.profileCurrentPin.value.trim();
   const nextName = el.profileName.value.trim();
   const nextEmail = el.profileEmail.value.trim();
+  const nextPostcode = el.profilePostcode.value.trim();
+  const nextAddress = el.profileAddress.value.trim();
   const nextPin = el.profileNewPin.value.trim();
 
   if (!currentPin) throw new Error("현재 PIN을 입력하세요.");
 
   const hasNameChange = nextName !== (state.me.name || "");
   const hasEmailChange = nextEmail !== (state.me.email || "");
+  const hasPostcodeChange = nextPostcode !== (state.me.postcode || "");
+  const hasAddressChange = nextAddress !== (state.me.address || "");
   const hasPinChange = Boolean(nextPin);
 
-  if (!hasNameChange && !hasEmailChange && !hasPinChange) {
+  if (!hasNameChange && !hasEmailChange && !hasPostcodeChange && !hasAddressChange && !hasPinChange) {
     throw new Error("변경할 항목을 입력하세요.");
   }
 
@@ -632,6 +781,8 @@ async function updateProfile() {
   const body = { currentPin };
   if (hasNameChange) body.name = nextName;
   if (hasEmailChange) body.email = nextEmail || null;
+  if (hasPostcodeChange) body.postcode = nextPostcode || null;
+  if (hasAddressChange) body.address = nextAddress || null;
   if (hasPinChange) body.newPin = nextPin;
 
   const data = await api("/me", { method: "PATCH", body });
@@ -666,10 +817,21 @@ el.depositBtn.addEventListener("click", wrapHandler(doDeposit));
 el.withdrawBtn.addEventListener("click", wrapHandler(doWithdraw));
 el.transferBtn.addEventListener("click", wrapHandler(doTransfer));
 el.createAccountBtn.addEventListener("click", wrapHandler(createAccount));
+el.newAddressSearchBtn.addEventListener(
+  "click",
+  wrapHandler(() => openDaumPostcode({ postcodeInput: el.newPostcode, addressInput: el.newAddress }))
+);
 el.updateProfileBtn.addEventListener("click", wrapHandler(updateProfile));
+el.profileAddressSearchBtn.addEventListener(
+  "click",
+  wrapHandler(() => openDaumPostcode({ postcodeInput: el.profilePostcode, addressInput: el.profileAddress }))
+);
 el.adjustBtn.addEventListener("click", wrapHandler(() => guard("admin", adjustBalance)));
 el.freezeBtn.addEventListener("click", wrapHandler(() => guard("admin", toggleFreeze)));
 el.updateEmailBtn.addEventListener("click", wrapHandler(() => guard("admin", updateSelectedEmail)));
+el.fxRefreshBtn.addEventListener("click", () => {
+  void refreshFxTicker();
+});
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !state.me) {
@@ -678,6 +840,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 (async function init() {
+  startFxTicker();
   const restored = await restoreSession();
   if (!restored) {
     setSessionView(false);
