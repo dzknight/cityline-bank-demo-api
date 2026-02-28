@@ -3,6 +3,12 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+let nodemailer;
+try {
+  nodemailer = require("nodemailer");
+} catch (error) {
+  nodemailer = null;
+}
 let mysql;
 try {
   mysql = require("mysql2/promise");
@@ -50,9 +56,25 @@ const DB_CONFIG = {
   password: process.env.MYSQL_PASSWORD || "",
   database: process.env.MYSQL_DATABASE || "cityline_bank",
 };
+const EMAIL_CONFIG = {
+  host: process.env.SMTP_HOST || "",
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: String(process.env.SMTP_SECURE || "").toLowerCase() === "true",
+  user: process.env.SMTP_USER || "",
+  pass: process.env.SMTP_PASS || "",
+  from: process.env.EMAIL_FROM || process.env.SMTP_USER || "",
+};
+const EMAIL_ENABLED = Boolean(
+  nodemailer &&
+    EMAIL_CONFIG.host &&
+    EMAIL_CONFIG.user &&
+    EMAIL_CONFIG.pass
+);
+let emailTransporterWarningLogged = false;
 
 const app = express();
 let db = null;
+let emailTransporter = null;
 
 const defaultState = {
   config: {
@@ -64,6 +86,7 @@ const defaultState = {
       role: "admin",
       name: "Cityline Bank 관리자",
       pin: "0000",
+      email: "admin@cityline-bank.local",
       balance: 0,
       frozen: false,
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -73,6 +96,7 @@ const defaultState = {
       role: "customer",
       name: "김하늘",
       pin: "1234",
+      email: "customer1@cityline-bank.local",
       balance: 120000,
       frozen: false,
       createdAt: "2026-01-05T00:00:00.000Z",
@@ -82,6 +106,7 @@ const defaultState = {
       role: "customer",
       name: "박소윤",
       pin: "4321",
+      email: "customer2@cityline-bank.local",
       balance: 76000,
       frozen: false,
       createdAt: "2026-01-06T00:00:00.000Z",
@@ -105,6 +130,193 @@ function now() {
   return new Date().toISOString();
 }
 
+function isValidEmail(value) {
+  return (
+    typeof value === "string" &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+  );
+}
+
+function isValidPin(value) {
+  return /^[0-9]{4,8}$/.test(String(value || ""));
+}
+
+function hashPin(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest();
+}
+
+function getMissingSmtpConfigItems() {
+  const missing = [];
+  if (!nodemailer) missing.push("nodemailer");
+  if (!EMAIL_CONFIG.host) missing.push("SMTP_HOST");
+  if (!EMAIL_CONFIG.user) missing.push("SMTP_USER");
+  if (!EMAIL_CONFIG.pass) missing.push("SMTP_PASS");
+  return missing;
+}
+
+function warnEmailConfigUnavailable() {
+  if (emailTransporterWarningLogged) return;
+  emailTransporterWarningLogged = true;
+  const missing = getMissingSmtpConfigItems();
+  if (missing.length) {
+    const hasDependencyIssue = missing.includes("nodemailer");
+    if (hasDependencyIssue) {
+      console.warn("메일 발송 비활성화: nodemailer 모듈이 설치되지 않았습니다.");
+      console.warn("`npm --prefix server install`(또는 `npm install` in server/) 후 서버를 재시작하세요.");
+      return;
+    }
+    console.warn(`메일 발송 비활성화: ${missing.join(", ")} 값이 설정되지 않았습니다.`);
+    console.warn("서버 재시작 전 `server/.env`에 SMTP_* 환경변수를 추가하세요.");
+  } else {
+    console.warn("메일 발송 비활성화: SMTP 초기화가 불가한 상태입니다.");
+  }
+}
+
+function getEmailTransporter() {
+  if (!EMAIL_ENABLED) return null;
+  if (emailTransporter) return emailTransporter;
+
+  emailTransporter = nodemailer.createTransport({
+    host: EMAIL_CONFIG.host,
+    port: EMAIL_CONFIG.port || 587,
+    secure: EMAIL_CONFIG.secure,
+    auth: {
+      user: EMAIL_CONFIG.user,
+      pass: EMAIL_CONFIG.pass,
+    },
+  });
+  return emailTransporter;
+}
+
+function formatKrw(value) {
+  return `${Number(value).toLocaleString("ko-KR")}원`;
+}
+
+async function sendTransferCompletedEmail({ sender, receiver, txn }) {
+  if (!sender) {
+    console.warn("이체 알림 실패: 발신 계좌 정보를 찾지 못했습니다.");
+    return;
+  }
+  if (!sender.email || !isValidEmail(sender.email)) {
+    console.warn(`이체 알림 실패: ${sender.accountNo}의 이메일이 없거나 형식이 유효하지 않습니다.`);
+    return;
+  }
+
+  const transporter = getEmailTransporter();
+  if (!transporter) {
+    warnEmailConfigUnavailable();
+    return;
+  }
+
+  const transferDate = normalizeDate(txn.ts) || now();
+  const isPending = txn.status === "PENDING_APPROVAL";
+  const subject = isPending
+    ? `[Cityline Bank] 이체 승인 대기 알림 (${txn.id})`
+    : `[Cityline Bank] 이체 처리 알림 (${txn.id})`;
+  const toText = receiver?.accountNo || txn.to;
+  const statusText = isPending
+    ? "승인 대기 중"
+    : txn.status === "REJECTED" || txn.status === "FAILED"
+      ? "실패"
+      : "완료";
+
+  const text = [
+    `${sender.name}님,`,
+    "",
+    `고객님의 계좌에서 이체가 ${statusText} 상태입니다.`,
+    `거래 ID: ${txn.id}`,
+    `출금 계좌: ${sender.accountNo}`,
+    `입금 계좌: ${toText}`,
+    `금액: ${formatKrw(txn.amount)}`,
+    `메모: ${txn.memo || "-"}`,
+      `일시: ${transferDate}`,
+    "",
+    "Cityline Bank",
+  ].join("\n");
+
+  await transporter.sendMail({
+    from: EMAIL_CONFIG.from,
+    to: sender.email,
+    subject,
+    text,
+  });
+}
+
+async function notifyAccountTransactionCompleted(txn) {
+  const account = findAccount(txn.from);
+  if (!account || account.role !== "customer") return;
+  if (!account.email || !isValidEmail(account.email)) return;
+  const receiver = findAccount(txn.to);
+
+  const status = txn.status || "COMPLETED";
+  const isPending = status === "PENDING_APPROVAL";
+  let action = "";
+  if (txn.type === "이체") action = "이체";
+  else if (txn.type === "입금") action = "입금";
+  else if (txn.type === "출금") action = "출금";
+
+  if (!action) return;
+
+  const subject =
+    status === "PENDING_APPROVAL"
+      ? `[Cityline Bank] ${action} 승인 대기 알림 (${txn.id})`
+      : `[Cityline Bank] ${action} 처리 알림 (${txn.id})`;
+  const toText = txn.type === "이체" ? (receiver?.accountNo || txn.to || "-") : "-";
+  const statusText =
+    status === "PENDING_APPROVAL"
+      ? "승인 대기 중"
+      : status === "REJECTED" || status === "FAILED"
+        ? "실패"
+        : "완료";
+
+  const text = [
+    `${account.name}님,`,
+    "",
+    `고객님의 계좌에서 ${action}가 ${statusText} 상태입니다.`,
+    `거래 ID: ${txn.id}`,
+    `계좌번호: ${account.accountNo}`,
+    `대상 계좌: ${toText}`,
+    `금액: ${formatKrw(txn.amount)}`,
+    `메모: ${txn.memo || "-"}`,
+    `일시: ${normalizeDate(txn.ts) || now()}`,
+    "",
+    "Cityline Bank",
+  ].join("\n");
+
+  const transporter = getEmailTransporter();
+  if (!transporter) {
+    warnEmailConfigUnavailable();
+    return;
+  }
+
+  await transporter.sendMail({
+    from: EMAIL_CONFIG.from,
+    to: account.email,
+    subject,
+    text,
+  });
+}
+
+function notifyTransferCompleted(txn) {
+  const sender = findAccount(txn.from);
+  if (!sender || sender.role !== "customer") {
+    if (sender) console.warn(`이체 알림 실패: ${sender.accountNo}는 고객 계좌가 아닙니다.`);
+    return;
+  }
+
+  const receiver = findAccount(txn.to);
+  void sendTransferCompletedEmail({
+    sender,
+    receiver,
+    txn: {
+      ...txn,
+      ts: txn.ts || now(),
+    },
+  }).catch((error) => {
+    console.error("이체 완료 메일 발송 실패:", error.message);
+  });
+}
+
 function randomToken() {
   return `sess_${Date.now()}_${crypto.randomBytes(16).toString("hex")}`;
 }
@@ -121,7 +333,9 @@ function loadState() {
     const parsed = raw ? JSON.parse(raw) : {};
     const state = clone(defaultState);
     state.config = { ...defaultState.config, ...(parsed.config || {}) };
-    state.accounts = Array.isArray(parsed.accounts) ? parsed.accounts : state.accounts;
+    state.accounts = Array.isArray(parsed.accounts)
+      ? parsed.accounts.map((account) => ({ ...account, email: account.email || null }))
+      : state.accounts;
     state.nextSeq = Number.isFinite(parsed.nextSeq) ? parsed.nextSeq : state.nextSeq;
     state.sessions = {};
     return state;
@@ -142,6 +356,7 @@ function publicAccount(account) {
     role: account.role,
     name: account.name,
     balance: account.balance,
+    email: account.email || null,
     frozen: account.frozen,
     createdAt: account.createdAt,
   };
@@ -165,6 +380,7 @@ function mapTxnTypeToUi(type) {
     ADMIN_ADJUST: "관리자 조정",
     ACCOUNT_FREEZE: "계좌 잠금",
     ACCOUNT_UNFREEZE: "계좌 해제",
+    ADMIN_EMAIL_UPDATE: "이메일 변경",
   };
   return map[type] || type;
 }
@@ -178,6 +394,7 @@ function mapTxnTypeToDb(type) {
     "관리자 조정": "ADMIN_ADJUST",
     "계좌 잠금": "ACCOUNT_FREEZE",
     "계좌 해제": "ACCOUNT_UNFREEZE",
+    "이메일 변경": "ADMIN_EMAIL_UPDATE",
   };
   return map[type] || type;
 }
@@ -238,6 +455,7 @@ async function initDb() {
       role ENUM('admin', 'customer') NOT NULL DEFAULT 'customer',
       login_id VARCHAR(64) NOT NULL UNIQUE,
       name VARCHAR(80) NOT NULL,
+      email VARCHAR(255) NULL,
       pin_hash VARBINARY(128) NOT NULL,
       is_active TINYINT(1) NOT NULL DEFAULT 1,
       created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -260,7 +478,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS transactions (
       transaction_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
       txn_key VARCHAR(64) NOT NULL UNIQUE,
-      type ENUM('DEPOSIT', 'WITHDRAW', 'TRANSFER', 'ACCOUNT_CREATE', 'ADMIN_ADJUST', 'ACCOUNT_FREEZE', 'ACCOUNT_UNFREEZE') NOT NULL,
+      type ENUM('DEPOSIT', 'WITHDRAW', 'TRANSFER', 'ACCOUNT_CREATE', 'ADMIN_ADJUST', 'ACCOUNT_FREEZE', 'ACCOUNT_UNFREEZE', 'ADMIN_EMAIL_UPDATE') NOT NULL,
       status ENUM('PENDING_APPROVAL', 'COMPLETED', 'REJECTED', 'FAILED') NOT NULL DEFAULT 'COMPLETED',
       actor_account_id BIGINT UNSIGNED NULL,
       memo VARCHAR(255),
@@ -310,6 +528,19 @@ async function initDb() {
     for (const statement of statements) {
       await conn.query(`${statement};`);
     }
+
+    const [emailColumns] = await conn.query("SHOW COLUMNS FROM users LIKE 'email'");
+    if (!emailColumns.length) {
+      await conn.query("ALTER TABLE users ADD COLUMN email VARCHAR(255) NULL");
+    }
+
+    const [txnTypeColumns] = await conn.query("SHOW COLUMNS FROM transactions LIKE 'type'");
+    const txnTypeColumn = String(txnTypeColumns[0]?.Type || "");
+    if (!txnTypeColumn.includes("ADMIN_EMAIL_UPDATE")) {
+      await conn.query(
+        "ALTER TABLE transactions MODIFY type ENUM('DEPOSIT', 'WITHDRAW', 'TRANSFER', 'ACCOUNT_CREATE', 'ADMIN_ADJUST', 'ACCOUNT_FREEZE', 'ACCOUNT_UNFREEZE', 'ADMIN_EMAIL_UPDATE') NOT NULL"
+      );
+    }
   } finally {
     conn.release();
   }
@@ -354,8 +585,14 @@ async function ensureDbAccount(accountNo) {
   }
 
   await query(
-    "INSERT INTO users (role, login_id, name, pin_hash) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), role = VALUES(role), updated_at = CURRENT_TIMESTAMP(6)",
-    [account.role === "admin" ? "admin" : "customer", accountNo, account.name, crypto.createHash("sha256").update(String(account.pin || "0000")).digest()]
+    "INSERT INTO users (role, login_id, name, email, pin_hash) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name), email = VALUES(email), role = VALUES(role), updated_at = CURRENT_TIMESTAMP(6)",
+    [
+      account.role === "admin" ? "admin" : "customer",
+      accountNo,
+      account.name,
+      account.email || null,
+      hashPin(account.pin || "0000"),
+    ]
   );
 
   const userRows = await query("SELECT user_id FROM users WHERE login_id = ?", [accountNo]);
@@ -506,6 +743,13 @@ async function createTxn(payload) {
     }
 
     await conn.commit();
+    if (dbType === "TRANSFER") {
+      notifyTransferCompleted(txn);
+    } else if (dbType === "DEPOSIT" || dbType === "WITHDRAW") {
+      void notifyAccountTransactionCompleted(txn).catch((error) => {
+        console.error("입출금 알림 메일 발송 실패:", error.message);
+      });
+    }
     return txn;
   } catch (error) {
     await conn.rollback();
@@ -623,6 +867,88 @@ app.get("/api/me", requireAuth, (req, res) => {
     account: publicAccount(req.auth.account),
     approvalThreshold: state.config.approvalThreshold,
   });
+});
+
+app.patch("/api/me", requireAuth, async (req, res) => {
+  const account = req.auth.account;
+  const body = req.body || {};
+
+  const currentPin = String(body.currentPin || "").trim();
+  if (!currentPin) {
+    return res.status(400).json({ error: "CURRENT_PIN_REQUIRED" });
+  }
+  if (account.pin !== currentPin) {
+    return res.status(401).json({ error: "INVALID_CURRENT_PIN" });
+  }
+
+  const hasName = Object.prototype.hasOwnProperty.call(body, "name");
+  const hasEmail = Object.prototype.hasOwnProperty.call(body, "email");
+  const hasNewPin = Object.prototype.hasOwnProperty.call(body, "newPin");
+  const nextName = hasName ? String(body.name || "").trim() : account.name;
+  const normalizedEmail = hasEmail ? String(body.email || "").trim() : (account.email || "");
+  const nextEmail = hasEmail ? (normalizedEmail || null) : account.email;
+  const nextPin = hasNewPin ? String(body.newPin || "").trim() : account.pin;
+
+  if (hasName && !nextName) {
+    return res.status(400).json({ error: "NAME_REQUIRED" });
+  }
+  if (hasEmail && nextEmail && !isValidEmail(nextEmail)) {
+    return res.status(400).json({ error: "BAD_EMAIL" });
+  }
+  if (hasNewPin && !isValidPin(nextPin)) {
+    return res.status(400).json({ error: "BAD_PIN" });
+  }
+
+  const changed = (hasName && nextName !== account.name) || (hasEmail && nextEmail !== account.email) || (hasNewPin && nextPin !== account.pin);
+  if (!changed) {
+    return res.json({ account: publicAccount(account), updated: false, transaction: null });
+  }
+
+  const previousName = account.name;
+  const previousEmail = account.email;
+  const previousPin = account.pin;
+  account.name = nextName;
+  account.email = nextEmail;
+  account.pin = nextPin;
+
+  const setTokens = ["name = ?", "email = ?", "updated_at = CURRENT_TIMESTAMP(6)"];
+  const params = [account.name, account.email];
+  if (hasNewPin) {
+    setTokens.splice(2, 0, "pin_hash = ?");
+    params.push(hashPin(account.pin));
+  }
+
+  try {
+    await ensureDbAccount(account.accountNo);
+    await query(`UPDATE users SET ${setTokens.join(", ")} WHERE login_id = ?`, [...params, account.accountNo]);
+
+    let txn = null;
+    if (hasEmail && previousEmail !== nextEmail) {
+      txn = await createTxn({
+        type: "이메일 변경",
+        actor: account.accountNo,
+        from: account.accountNo,
+        to: account.accountNo,
+        amount: 0,
+        memo: `${previousEmail || "-"} -> ${nextEmail || "-"}`,
+        status: "COMPLETED",
+      });
+    }
+
+    persistState();
+    return res.json({ account: publicAccount(account), updated: true, transaction: txn });
+  } catch (error) {
+    account.name = previousName;
+    account.email = previousEmail;
+    account.pin = previousPin;
+    await query("UPDATE users SET name = ?, email = ?, pin_hash = ?, updated_at = CURRENT_TIMESTAMP(6) WHERE login_id = ?", [
+      previousName,
+      previousEmail,
+      hashPin(previousPin || "0000"),
+      account.accountNo,
+    ]).catch(() => {});
+    return logDbError(res, error, 500);
+  }
 });
 
 app.get("/api/config", requireAuth, (req, res) => {
@@ -803,6 +1129,7 @@ app.post("/api/transfer", requireAuth, async (req, res) => {
 app.post("/api/admin/accounts", requireAuth, requireAdmin, async (req, res) => {
   const name = String(req.body.name || "").trim();
   const pin = String(req.body.pin || "");
+  const email = String(req.body.email || "").trim();
   const initialBalance = Number(req.body.initialBalance || 0);
 
   if (!name) {
@@ -810,6 +1137,9 @@ app.post("/api/admin/accounts", requireAuth, requireAdmin, async (req, res) => {
   }
   if (!/^[0-9]{4,8}$/.test(pin)) {
     return res.status(400).json({ error: "BAD_PIN" });
+  }
+  if (email && !isValidEmail(email)) {
+    return res.status(400).json({ error: "BAD_EMAIL" });
   }
   if (!Number.isFinite(initialBalance) || initialBalance < 0 || Math.floor(initialBalance) !== initialBalance) {
     return res.status(400).json({ error: "BAD_INITIAL_BALANCE" });
@@ -821,6 +1151,7 @@ app.post("/api/admin/accounts", requireAuth, requireAdmin, async (req, res) => {
     role: "customer",
     name,
     pin,
+    email: email || null,
     balance: initialBalance,
     frozen: false,
     createdAt: now(),
@@ -846,6 +1177,48 @@ app.post("/api/admin/accounts", requireAuth, requireAdmin, async (req, res) => {
   } catch (error) {
     state.accounts = state.accounts.filter((item) => item.accountNo !== accountNo);
     state.nextSeq -= 1;
+    return logDbError(res, error, 500);
+  }
+});
+
+app.patch("/api/admin/accounts/:accountNo/email", requireAuth, requireAdmin, async (req, res) => {
+  const account = findAccount(req.params.accountNo);
+  if (!account) {
+    return res.status(404).json({ error: "ACCOUNT_NOT_FOUND" });
+  }
+  if (account.role === "admin") {
+    return res.status(403).json({ error: "CANNOT_MODIFY_ADMIN_ACCOUNT" });
+  }
+
+  const email = String(req.body.email || "").trim();
+  if (email && !isValidEmail(email)) {
+    return res.status(400).json({ error: "BAD_EMAIL" });
+  }
+
+  const normalized = email || null;
+  if (account.email === normalized) {
+    return res.json({ account: publicAccount(account), updated: false });
+  }
+
+  const previousEmail = account.email;
+  account.email = normalized;
+  try {
+    await ensureDbAccount(account.accountNo);
+    await query("UPDATE users SET email = ? WHERE login_id = ?", [normalized, account.accountNo]);
+    const txn = await createTxn({
+      type: "이메일 변경",
+      actor: req.auth.account.accountNo,
+      from: req.auth.account.accountNo,
+      to: account.accountNo,
+      amount: 0,
+      memo: `${previousEmail || "-"} -> ${normalized || "-"}`,
+      status: "COMPLETED",
+    });
+    persistState();
+    return res.json({ account: publicAccount(account), transaction: txn, updated: true });
+  } catch (error) {
+    account.email = previousEmail;
+    await query("UPDATE users SET email = ? WHERE login_id = ?", [previousEmail, account.accountNo]).catch(() => {});
     return logDbError(res, error, 500);
   }
 });
@@ -972,6 +1345,7 @@ app.post("/api/admin/transactions/:txnId/approve", requireAuth, requireAdmin, as
         to.balance = prevToBalance;
         return res.status(409).json({ error: "TRANSACTION_STATE_CHANGED", transaction: await findTxn(txn.id) });
       }
+      void notifyTransferCompleted(updated);
       persistState();
       return res.json({ transaction: updated });
     } catch (error) {
@@ -1017,6 +1391,9 @@ app.use((req, res) => {
     app.listen(PORT, () => {
       console.log(`Cityline Bank API 서버 시작: http://localhost:${PORT}`);
       console.log("MariaDB transactions table:", DB_CONFIG.database);
+      if (!EMAIL_ENABLED) {
+        warnEmailConfigUnavailable();
+      }
     });
   } catch (error) {
     console.error("서버 초기화 실패:", error.message);

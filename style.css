@@ -157,7 +157,7 @@ button {
 .button-row {
   display: grid;
   gap: 0.5rem;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
 }
 
 .stats {
@@ -284,6 +284,20 @@ tbody td {
 .tag.freeze {
   background: rgba(255, 183, 77, 0.16);
   border-color: rgba(255, 183, 77, 0.55);
+}
+
+.audit-log-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.audit-log-table th,
+.audit-log-table td {
+  white-space: nowrap;
+}
+
+.audit-log-table td:last-child {
+  white-space: normal;
 }
 
 .toast {

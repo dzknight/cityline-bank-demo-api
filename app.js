@@ -25,6 +25,13 @@ const el = {
   loginBtn: document.getElementById("loginBtn"),
   toast: document.getElementById("toast"),
   sessionInfo: document.getElementById("sessionInfo"),
+  profileSection: document.getElementById("profileSection"),
+  profileAccount: document.getElementById("profileAccount"),
+  profileName: document.getElementById("profileName"),
+  profileEmail: document.getElementById("profileEmail"),
+  profileCurrentPin: document.getElementById("profileCurrentPin"),
+  profileNewPin: document.getElementById("profileNewPin"),
+  updateProfileBtn: document.getElementById("updateProfileBtn"),
   custName: document.getElementById("custName"),
   custNo: document.getElementById("custNo"),
   custBalance: document.getElementById("custBalance"),
@@ -50,13 +57,16 @@ const el = {
   adminPendingApprovals: document.getElementById("adminPendingApprovals"),
   newName: document.getElementById("newName"),
   newPin: document.getElementById("newPin"),
+  newEmail: document.getElementById("newEmail"),
   initialBalance: document.getElementById("initialBalance"),
   createAccountBtn: document.getElementById("createAccountBtn"),
   selectedAccount: document.getElementById("selectedAccount"),
+  targetEmail: document.getElementById("targetEmail"),
   targetAmount: document.getElementById("targetAmount"),
   targetMemo: document.getElementById("targetMemo"),
   adjustBtn: document.getElementById("adjustBtn"),
   freezeBtn: document.getElementById("freezeBtn"),
+  updateEmailBtn: document.getElementById("updateEmailBtn"),
 };
 
 function money(num) {
@@ -84,9 +94,15 @@ function clearInputs() {
   el.withdrawMemo.value = "";
   el.transferTo.value = "";
   el.transferAmount.value = "";
+  el.profileName.value = "";
+  el.profileEmail.value = "";
+  el.profileCurrentPin.value = "";
+  el.profileNewPin.value = "";
   el.newName.value = "";
   el.newPin.value = "";
+  el.newEmail.value = "";
   el.initialBalance.value = "";
+  el.targetEmail.value = "";
   el.targetAmount.value = "";
   el.targetMemo.value = "";
 }
@@ -96,6 +112,16 @@ function statusTag(status) {
   if (status === "REJECTED") return '<span class="tag freeze">거부</span>';
   if (status === "FAILED") return '<span class="tag freeze">실패</span>';
   return '<span class="tag">완료</span>';
+}
+
+function parseEmailChangeMemo(txn) {
+  if (txn.type !== "이메일 변경") return null;
+  const text = String(txn.memo || "");
+  const matched = text.match(/^(.*?)\s*->\s*(.*?)$/);
+  if (!matched) return { before: "-", after: "-" };
+  const before = matched[1]?.trim() || "-";
+  const after = matched[2]?.trim() || "-";
+  return { before, after };
 }
 
 function signedAmountClass(amount, txn) {
@@ -166,6 +192,7 @@ function api(path, options = {}) {
 
 function setSessionView(isSignedIn, role) {
   el.loginSection.classList.toggle("hidden", isSignedIn);
+  el.profileSection.classList.toggle("hidden", !isSignedIn);
   el.customerSection.classList.toggle("hidden", !isSignedIn || role !== "customer");
   el.adminSection.classList.toggle("hidden", !isSignedIn || role !== "admin");
   el.logoutBtn.disabled = !isSignedIn;
@@ -186,6 +213,15 @@ function clearSession() {
   localStorage.removeItem(AUTH_STORAGE_KEY);
 }
 
+function renderProfilePanel() {
+  if (!state.me) return;
+  el.profileAccount.textContent = `${state.me.name} (${state.me.accountNo})`;
+  el.profileName.value = state.me.name || "";
+  el.profileEmail.value = state.me.email || "";
+  el.profileCurrentPin.value = "";
+  el.profileNewPin.value = "";
+}
+
 function parseAmount(value) {
   const normalized = Number(value);
   if (!Number.isFinite(normalized) || normalized <= 0 || Math.floor(normalized) !== normalized) {
@@ -200,6 +236,10 @@ function parseAdjustAmount(value) {
     throw new Error("조정 금액은 0이 아닌 정수여야 합니다.");
   }
   return normalized;
+}
+
+function isValidEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
 async function restoreSession() {
@@ -278,6 +318,7 @@ function renderAdmin() {
       <tr class="row ${state.selectedAccountNo === account.accountNo ? "selected" : ""}">
         <td>${account.accountNo}</td>
         <td>${account.name}</td>
+        <td>${account.email || "-"}</td>
         <td>${money(account.balance)}</td>
         <td>${account.frozen ? '<span class="tag freeze">잠김</span>' : '<span class="tag">정상</span>'}</td>
         <td><button class="ghost-btn" data-select="${account.accountNo}">선택</button></td>
@@ -292,40 +333,63 @@ function renderAdmin() {
         <tr>
           <th>계좌번호</th>
           <th>예금주</th>
+          <th>이메일</th>
           <th>잔액</th>
           <th>상태</th>
           <th>작업</th>
         </tr>
       </thead>
-      <tbody>${rows || "<tr><td colspan='5'>고객 계좌가 없습니다.</td></tr>"}</tbody>
+      <tbody>${rows || "<tr><td colspan='6'>고객 계좌가 없습니다.</td></tr>"}</tbody>
     </table>
   `;
 
   const selected = state.accounts.find((account) => account.accountNo === state.selectedAccountNo);
   el.selectedAccount.textContent = selected ? `${selected.name} (${selected.accountNo})` : "없음";
+  el.targetEmail.value = selected ? selected.email || "" : "";
   el.adjustBtn.disabled = !selected;
   el.freezeBtn.disabled = !selected;
+  el.updateEmailBtn.disabled = !selected;
 
   if (state.txns.length === 0) {
     el.adminLedger.innerHTML = '<div class="ledger-item">감사 로그가 없습니다.</div>';
   } else {
-    el.adminLedger.innerHTML = state.txns
-      .map((txn) => {
-        const counterpart = `${txn.from} → ${txn.to}`;
-        return `
-          <div class="ledger-item">
-            <div class="ledger-main">
-              <strong>${txn.type}</strong>
-              <span>${money(txn.amount)}</span>
-            </div>
-            <div class="ledger-meta">
-              ${formatDateTime(txn.ts)} · ${txn.actor || "-"} · ${counterpart} · ${statusTag(txn.status)}
-              <br/>메모: ${txn.memo || "-"}
-            </div>
-          </div>
-        `;
-      })
-      .join("");
+    const emailChangeRows = state.txns.map((txn) => {
+      const counterpart = `${txn.from || "-"} → ${txn.to || "-"}`;
+      const emailChange = parseEmailChangeMemo(txn) || { before: "-", after: "-" };
+
+      return `
+        <tr>
+          <td>${formatDateTime(txn.ts)}</td>
+          <td>${txn.type}</td>
+          <td>${txn.actor || "-"}</td>
+          <td>${counterpart}</td>
+          <td>${statusTag(txn.status)}</td>
+          <td>${txn.type === "이메일 변경" ? "-" : money(txn.amount)}</td>
+          <td>${emailChange.before}</td>
+          <td>${emailChange.after}</td>
+          <td>${txn.memo || "-"}</td>
+        </tr>
+      `;
+    });
+
+    el.adminLedger.innerHTML = `
+      <table class="audit-log-table">
+        <thead>
+          <tr>
+            <th>일시</th>
+            <th>유형</th>
+            <th>요청자</th>
+            <th>상대</th>
+            <th>상태</th>
+            <th>금액</th>
+            <th>이전 이메일</th>
+            <th>변경 이메일</th>
+            <th>메모</th>
+          </tr>
+        </thead>
+        <tbody>${emailChangeRows.join("")}</tbody>
+      </table>
+    `;
   }
 
   if (state.pendingApprovals.length === 0) {
@@ -378,6 +442,8 @@ async function render() {
   }
 
   setSessionView(true, state.me.role);
+  renderProfilePanel();
+
   if (state.me.role === "admin") {
     await fetchAdminData();
     renderAdmin();
@@ -455,15 +521,17 @@ async function doTransfer() {
 async function createAccount() {
   const name = el.newName.value.trim();
   const pin = el.newPin.value.trim();
+  const email = el.newEmail.value.trim();
   const initialBalance = Number(el.initialBalance.value || 0);
   if (!name) throw new Error("예금주명을 입력하세요.");
   if (!/^[0-9]{4,8}$/.test(pin)) throw new Error("PIN은 숫자 4~8자리여야 합니다.");
   if (!Number.isFinite(initialBalance) || initialBalance < 0 || Math.floor(initialBalance) !== initialBalance) {
     throw new Error("초기 입금은 0 이상의 정수여야 합니다.");
   }
+  if (email && !isValidEmail(email)) throw new Error("이메일 형식이 올바르지 않습니다.");
   const created = await api("/admin/accounts", {
     method: "POST",
-    body: { name, pin, initialBalance },
+    body: { name, pin, email: email || null, initialBalance },
   });
   await render();
   clearInputs();
@@ -488,6 +556,21 @@ async function adjustBalance() {
   await render();
   clearInputs();
   showToast("잔액 조정이 완료되었습니다.");
+}
+
+async function updateSelectedEmail() {
+  const account = validateAdminTarget();
+  const emailValue = el.targetEmail.value.trim();
+  if (emailValue && !isValidEmail(emailValue)) {
+    throw new Error("이메일 형식이 올바르지 않습니다.");
+  }
+  await api(`/admin/accounts/${account.accountNo}/email`, {
+    method: "PATCH",
+    body: { email: emailValue || null },
+  });
+  await render();
+  clearInputs();
+  showToast("계좌 이메일이 수정되었습니다.");
 }
 
 async function toggleFreeze() {
@@ -520,6 +603,46 @@ async function rejectPendingTransaction(txnId) {
   showToast("이체 요청을 거부했습니다.");
 }
 
+async function updateProfile() {
+  if (!state.me) throw new Error("로그인 후 이용 가능합니다.");
+
+  const currentPin = el.profileCurrentPin.value.trim();
+  const nextName = el.profileName.value.trim();
+  const nextEmail = el.profileEmail.value.trim();
+  const nextPin = el.profileNewPin.value.trim();
+
+  if (!currentPin) throw new Error("현재 PIN을 입력하세요.");
+
+  const hasNameChange = nextName !== (state.me.name || "");
+  const hasEmailChange = nextEmail !== (state.me.email || "");
+  const hasPinChange = Boolean(nextPin);
+
+  if (!hasNameChange && !hasEmailChange && !hasPinChange) {
+    throw new Error("변경할 항목을 입력하세요.");
+  }
+
+  if (nextName === "") throw new Error("이름은 비워둘 수 없습니다.");
+  if (hasPinChange && !/^[0-9]{4,8}$/.test(nextPin)) {
+    throw new Error("새 PIN은 숫자 4~8자리여야 합니다.");
+  }
+  if (hasEmailChange && nextEmail && !isValidEmail(nextEmail)) {
+    throw new Error("이메일 형식이 올바르지 않습니다.");
+  }
+
+  const body = { currentPin };
+  if (hasNameChange) body.name = nextName;
+  if (hasEmailChange) body.email = nextEmail || null;
+  if (hasPinChange) body.newPin = nextPin;
+
+  const data = await api("/me", { method: "PATCH", body });
+  state.me = data.account;
+  await render();
+  el.profileCurrentPin.value = "";
+  el.profileNewPin.value = "";
+  clearInputs();
+  showToast(data.updated ? "내 정보가 수정되었습니다." : "변경된 내용이 없습니다.");
+}
+
 function guard(role, callback) {
   if (!state.me || state.me.role !== role) {
     throw new Error("권한이 없습니다.");
@@ -543,8 +666,10 @@ el.depositBtn.addEventListener("click", wrapHandler(doDeposit));
 el.withdrawBtn.addEventListener("click", wrapHandler(doWithdraw));
 el.transferBtn.addEventListener("click", wrapHandler(doTransfer));
 el.createAccountBtn.addEventListener("click", wrapHandler(createAccount));
+el.updateProfileBtn.addEventListener("click", wrapHandler(updateProfile));
 el.adjustBtn.addEventListener("click", wrapHandler(() => guard("admin", adjustBalance)));
 el.freezeBtn.addEventListener("click", wrapHandler(() => guard("admin", toggleFreeze)));
+el.updateEmailBtn.addEventListener("click", wrapHandler(() => guard("admin", updateSelectedEmail)));
 
 document.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !state.me) {
