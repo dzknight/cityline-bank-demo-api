@@ -1,0 +1,86 @@
+erDiagram
+    USERS {
+        BIGINT user_id PK
+        ENUM role
+        VARCHAR login_id UK
+        VARCHAR name
+        VARBINARY pin_hash
+        TINYINT is_active
+        DATETIME created_at
+        DATETIME updated_at
+    }
+
+    ACCOUNTS {
+        BIGINT account_id PK
+        VARCHAR account_no UK
+        BIGINT user_id FK
+        BIGINT balance
+        TINYINT is_frozen
+        DATETIME created_at
+        DATETIME updated_at
+    }
+
+    TRANSACTIONS {
+        BIGINT transaction_id PK
+        VARCHAR txn_key UK
+        ENUM type
+        ENUM status
+        BIGINT actor_account_id FK
+        VARCHAR memo
+        VARBINARY request_ip
+        VARCHAR idempotency_key UK
+        DATETIME created_at
+        DATETIME updated_at
+    }
+
+    TRANSACTION_ENTRIES {
+        BIGINT entry_id PK
+        BIGINT transaction_id FK
+        BIGINT account_id FK
+        ENUM entry_type
+        BIGINT amount
+        BIGINT counterparty_account_id FK
+        BIGINT balance_after
+        DATETIME created_at
+    }
+
+    TRANSACTION_REVIEWS {
+        BIGINT review_id PK
+        BIGINT transaction_id FK
+        BIGINT reviewer_account_id FK
+        ENUM decision
+        VARCHAR reason
+        DATETIME decided_at
+    }
+
+    ACCOUNT_STATUS_HISTORY {
+        BIGINT history_id PK
+        BIGINT account_id FK
+        BIGINT changed_by_account_id FK
+        TINYINT previous_state
+        TINYINT new_state
+        VARCHAR reason
+        DATETIME changed_at
+    }
+
+    V_ACCOUNT_BALANCE_SNAPSHOT {
+        BIGINT account_id
+        VARCHAR account_no
+        BIGINT balance
+        VARCHAR name
+        VARCHAR login_id
+        ENUM role
+        TINYINT is_frozen
+        DATETIME updated_at
+    }
+
+    USERS ||--o{ ACCOUNTS : owns
+    ACCOUNTS ||--o{ TRANSACTIONS : initiates
+    TRANSACTIONS ||--o{ TRANSACTION_ENTRIES : contains
+    ACCOUNTS ||--o{ TRANSACTION_ENTRIES : participates_in
+    ACCOUNTS }o--o| TRANSACTION_ENTRIES : counterparty
+    TRANSACTIONS ||--o{ TRANSACTION_REVIEWS : reviewed_by
+    ACCOUNTS ||--o{ TRANSACTION_REVIEWS : reviewer
+    ACCOUNTS ||--o{ ACCOUNT_STATUS_HISTORY : status_changed_on
+    USERS ||--o{ V_ACCOUNT_BALANCE_SNAPSHOT : reflected_as
+    ACCOUNTS ||--|| V_ACCOUNT_BALANCE_SNAPSHOT : materialized_view_of

@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "cityline-bank-demo-api": "file:.."
+  }
+}
