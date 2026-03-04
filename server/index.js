@@ -823,13 +823,26 @@ async function findTxn(txnId) {
   return mapTxnRow(rows[0]);
 }
 
-async function setTxnStatus(txnId, status, approval = {}) {
+async function findTxnByIdempotencyKey(idempotencyKey) {
+  const rows = await query(
+    getTxnSelectSql({ where: "t.idempotency_key = ?", orderBy: false }),
+    [idempotencyKey]
+  );
+  if (!rows.length) return null;
+  return mapTxnRow(rows[0]);
+}
+
+async function setTxnStatus(txnId, status, approval = {}, options = {}) {
   const existing = await query("SELECT transaction_id FROM transactions WHERE txn_key = ?", [txnId]);
   if (!existing.length) return null;
+  const expectedStatus = options.expectedStatus || "PENDING_APPROVAL";
   const conn = await db.getConnection();
   try {
     await conn.beginTransaction();
-    const [result] = await conn.execute("UPDATE transactions SET status = ? WHERE txn_key = ?", [status, txnId]);
+    const [result] = await conn.execute(
+      "UPDATE transactions SET status = ? WHERE txn_key = ? AND status = ?",
+      [status, txnId, expectedStatus]
+    );
     if (!result.affectedRows) {
       await conn.rollback();
       return null;
@@ -1297,9 +1310,38 @@ app.post("/api/transfer", requireAuth, async (req, res) => {
     const toAccountNo = String(req.body.toAccountNo || "").trim();
     const amount = parseAmount(req.body.amount);
     const memo = String(req.body.memo || `이체 ${toAccountNo}`).slice(0, 200);
+    const idempotencyKey = String(req.get("idempotency-key") || req.get("Idempotency-Key") || "").trim();
+
+    if (idempotencyKey.length > 128) {
+      return res.status(400).json({ error: "BAD_IDEMPOTENCY_KEY" });
+    }
+    if (idempotencyKey && !/^[A-Za-z0-9._-]+$/.test(idempotencyKey)) {
+      return res.status(400).json({ error: "BAD_IDEMPOTENCY_KEY" });
+    }
+
     const to = findAccount(toAccountNo);
     if (!toAccountNo) {
       return res.status(400).json({ error: "RECEIVER_REQUIRED" });
+    }
+    if (idempotencyKey) {
+      const duplicated = await findTxnByIdempotencyKey(idempotencyKey);
+      if (duplicated) {
+        if (
+          duplicated.type === "이체" &&
+          duplicated.actor === from.accountNo &&
+          duplicated.from === from.accountNo &&
+          duplicated.to === toAccountNo &&
+          Number(duplicated.amount) === amount &&
+          (duplicated.memo || "") === memo
+        ) {
+          return res.status(duplicated.status === "PENDING_APPROVAL" ? 202 : 201).json({
+            transaction: duplicated,
+            isPendingApproval: duplicated.status === "PENDING_APPROVAL",
+          });
+        }
+
+        return res.status(409).json({ error: "IDEMPOTENCY_KEY_CONFLICT", transaction: duplicated });
+      }
     }
     if (!to) {
       return res.status(404).json({ error: "RECEIVER_NOT_FOUND" });
@@ -1322,6 +1364,7 @@ app.post("/api/transfer", requireAuth, async (req, res) => {
         to: to.accountNo,
         amount,
         memo,
+        idempotencyKey: idempotencyKey || null,
         status: "PENDING_APPROVAL",
       });
       persistState();
@@ -1340,11 +1383,32 @@ app.post("/api/transfer", requireAuth, async (req, res) => {
         to: to.accountNo,
         amount,
         memo,
+        idempotencyKey: idempotencyKey || null,
         status: "COMPLETED",
       });
       persistState();
       return res.status(201).json({ transaction: txn, isPendingApproval: false });
     } catch (error) {
+      if (idempotencyKey && (error.code === "ER_DUP_ENTRY" || error.errno === 1062)) {
+        const duplicated = await findTxnByIdempotencyKey(idempotencyKey);
+        if (
+          duplicated &&
+          duplicated.type === "이체" &&
+          duplicated.actor === from.accountNo &&
+          duplicated.from === from.accountNo &&
+          duplicated.to === to.accountNo &&
+          Number(duplicated.amount) === amount &&
+          (duplicated.memo || "") === memo
+        ) {
+          return res.status(duplicated.status === "PENDING_APPROVAL" ? 202 : 201).json({
+            transaction: duplicated,
+            isPendingApproval: duplicated.status === "PENDING_APPROVAL",
+          });
+        }
+        if (duplicated) {
+          return res.status(409).json({ error: "IDEMPOTENCY_KEY_CONFLICT", transaction: duplicated });
+        }
+      }
       from.balance = prevFromBalance;
       to.balance = prevToBalance;
       return logDbError(res, error, 500);
@@ -1546,44 +1610,52 @@ app.post("/api/admin/transactions/:txnId/approve", requireAuth, requireAdmin, as
       const updated = await setTxnStatus(txn.id, "FAILED", {
         by: req.auth.account.accountNo,
         reason: "INVALID_ACCOUNT",
-      });
+      }, { expectedStatus: "PENDING_APPROVAL" });
       return res.status(409).json({ error: "INVALID_ACCOUNT", transaction: updated });
     }
     if (from.frozen || to.frozen) {
       const updated = await setTxnStatus(txn.id, "FAILED", {
         by: req.auth.account.accountNo,
         reason: "ACCOUNT_FROZEN",
-      });
+      }, { expectedStatus: "PENDING_APPROVAL" });
       return res.status(409).json({ error: "ACCOUNT_FROZEN", transaction: updated });
     }
     if (from.balance < txn.amount) {
       const updated = await setTxnStatus(txn.id, "FAILED", {
         by: req.auth.account.accountNo,
         reason: "INSUFFICIENT_FUNDS",
-      });
+      }, { expectedStatus: "PENDING_APPROVAL" });
       return res.status(409).json({ error: "INSUFFICIENT_FUNDS", transaction: updated });
     }
 
-    const prevFromBalance = from.balance;
-    const prevToBalance = to.balance;
-    from.balance -= txn.amount;
-    to.balance += txn.amount;
     try {
       const updated = await setTxnStatus(txn.id, "COMPLETED", {
         by: req.auth.account.accountNo,
         reason,
-      });
+      }, { expectedStatus: "PENDING_APPROVAL" });
       if (!updated) {
-        from.balance = prevFromBalance;
-        to.balance = prevToBalance;
         return res.status(409).json({ error: "TRANSACTION_STATE_CHANGED", transaction: await findTxn(txn.id) });
       }
-      void notifyTransferCompleted(updated);
-      persistState();
-      return res.json({ transaction: updated });
+
+      const prevFromBalance = from.balance;
+      const prevToBalance = to.balance;
+      from.balance -= txn.amount;
+      to.balance += txn.amount;
+
+      try {
+        persistState();
+        void notifyTransferCompleted(updated);
+        return res.json({ transaction: updated });
+      } catch (error) {
+        from.balance = prevFromBalance;
+        to.balance = prevToBalance;
+        await setTxnStatus(txn.id, "FAILED", {
+          by: req.auth.account.accountNo,
+          reason: "PERSISTENCE_FAILED",
+        }, { expectedStatus: "COMPLETED" });
+        throw error;
+      }
     } catch (error) {
-      from.balance = prevFromBalance;
-      to.balance = prevToBalance;
       return logDbError(res, error, 500);
     }
   } catch (error) {
@@ -1604,7 +1676,7 @@ app.post("/api/admin/transactions/:txnId/reject", requireAuth, requireAdmin, asy
     const updated = await setTxnStatus(req.params.txnId, "REJECTED", {
       by: req.auth.account.accountNo,
       reason,
-    });
+    }, { expectedStatus: "PENDING_APPROVAL" });
     if (!updated) {
       return res.status(409).json({ error: "TRANSACTION_STATE_CHANGED", transaction: await findTxn(req.params.txnId) });
     }

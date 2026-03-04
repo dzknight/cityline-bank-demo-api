@@ -14,6 +14,11 @@ const state = {
   txns: [],
   pendingApprovals: [],
   selectedAccountNo: null,
+  transferRequest: {
+    signature: null,
+    idempotencyKey: null,
+    inFlight: false,
+  },
 };
 let fxTickerTimer = null;
 let isFxRefreshing = false;
@@ -205,6 +210,7 @@ function api(path, options = {}) {
     method: options.method || "GET",
     headers: {
       "Content-Type": "application/json",
+      ...(options.headers || {}),
     },
   };
   if (state.token) config.headers["x-auth-token"] = state.token;
@@ -213,11 +219,145 @@ function api(path, options = {}) {
   return fetch(`${API_BASE}${path}`, config).then(async (response) => {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const error = data.error || data.message || `요청 실패 (${response.status})`;
-      throw new Error(error);
+      const error = new Error(data.error || data.message || `요청 실패 (${response.status})`);
+      error.status = response.status;
+      error.code = data.error;
+      throw error;
     }
     return data;
   });
+}
+
+const CONFLICT_ERROR_MESSAGES = {
+  IDEMPOTENCY_KEY_CONFLICT: "이미 처리된 요청입니다.",
+  SELF_TRANSFER_NOT_ALLOWED: "본인 계좌로는 이체할 수 없습니다.",
+  INSUFFICIENT_FUNDS: "잔액이 부족합니다.",
+  TRANSACTION_NOT_PENDING: "요청한 거래는 더 이상 승인 대기 상태가 아닙니다.",
+  INVALID_ACCOUNT: "요청한 계좌 정보를 다시 확인해주세요.",
+  ACCOUNT_FROZEN: "계좌가 동결되어 처리할 수 없습니다.",
+  TRANSACTION_STATE_CHANGED: "거래 상태가 변경되어 재시도해 주세요.",
+};
+
+const BAD_REQUEST_ERROR_MESSAGES = {
+  BAD_IDEMPOTENCY_KEY: "잘못된 Idempotency-Key 형식입니다.",
+  BAD_AMOUNT: "금액이 올바르지 않습니다.",
+  BAD_CURRENCY: "지원하지 않는 통화 코드입니다.",
+  RECEIVER_REQUIRED: "수취인 계좌번호를 확인해주세요.",
+  NAME_REQUIRED: "필수 항목(이름)을 입력해 주세요.",
+  BAD_PIN: "PIN은 숫자 4~8자리여야 합니다.",
+  CURRENT_PIN_REQUIRED: "현재 PIN을 입력해 주세요.",
+  INVALID_CURRENT_PIN: "현재 PIN이 일치하지 않습니다.",
+  BAD_EMAIL: "이메일 형식이 올바르지 않습니다.",
+  BAD_POSTCODE: "우편번호 형식이 올바르지 않습니다.",
+  BAD_ADDRESS: "주소 형식을 확인해 주세요.",
+  INVALID_AMOUNT: "금액이 올바르지 않습니다.",
+  BAD_REQUEST: "요청 형식이 올바르지 않습니다.",
+  TYPE_MISMATCH: "요청 데이터 형식이 올바르지 않습니다.",
+  ADJUST_AMOUNT_REQUIRED: "조정 금액을 확인해 주세요.",
+  BAD_INITIAL_BALANCE: "초기 입금액을 확인해 주세요.",
+};
+
+const UNAUTHORIZED_ERROR_MESSAGES = {
+  AUTH_TOKEN_REQUIRED: "로그인이 필요합니다.",
+  INVALID_CREDENTIALS: "계정 또는 PIN이 일치하지 않습니다.",
+  ACCOUNT_NOT_FOUND: "계정을 찾을 수 없습니다.",
+};
+
+const FORBIDDEN_ERROR_MESSAGES = {
+  FORBIDDEN: "해당 권한이 없습니다.",
+  CANNOT_MODIFY_ADMIN_ACCOUNT: "관리자 계좌는 수정할 수 없습니다.",
+};
+
+const LOCKED_STATE_MESSAGES = {
+  ACCOUNT_FROZEN: "계좌가 동결되어 있어 처리할 수 없습니다.",
+  RECEIVER_FROZEN: "수신 계좌가 동결되어 이체할 수 없습니다.",
+};
+
+const NOT_FOUND_ERROR_MESSAGES = {
+  RECEIVER_NOT_FOUND: "수신 계좌를 찾을 수 없습니다.",
+  ACCOUNT_NOT_FOUND: "계정을 찾을 수 없습니다.",
+  TRANSACTION_NOT_FOUND: "거래를 찾을 수 없습니다.",
+  NOT_FOUND: "요청한 API 경로 또는 리소스를 찾을 수 없습니다.",
+};
+
+const SERVER_ERROR_MESSAGES = {
+  DB_ERROR: "현재 서버 내부 처리에서 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+  FX_RATE_FETCH_ERROR: "환율 조회 연동에서 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+};
+
+const STATUS_FALLBACK_MESSAGES = {
+  400: "요청 형식이 올바르지 않습니다. 입력값을 다시 확인해 주세요.",
+  401: "인증이 필요하거나 인증이 만료되었습니다. 다시 로그인해 주세요.",
+  403: "이 작업을 수행할 수 있는 권한이 없습니다.",
+  409: "요청 상태가 변경되어 처리할 수 없습니다. 잠시 뒤 다시 시도해 주세요.",
+  423: "요청한 계좌 상태로 인해 처리가 제한됩니다.",
+  404: "요청한 데이터 또는 경로를 찾을 수 없습니다.",
+  500: "요청 처리 중 서버 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.",
+  502: "환율 조회 외부 연동 오류로 처리할 수 없습니다.",
+};
+
+function toUserMessage(error) {
+  if (!error) return "요청을 처리하지 못했습니다.";
+  const status = Number(error.status);
+  const code = String(error.code || "");
+
+  if (status === 409 && CONFLICT_ERROR_MESSAGES[code]) {
+    return CONFLICT_ERROR_MESSAGES[code];
+  }
+  if (status === 400 && BAD_REQUEST_ERROR_MESSAGES[code]) {
+    return BAD_REQUEST_ERROR_MESSAGES[code];
+  }
+  if (status === 401 && UNAUTHORIZED_ERROR_MESSAGES[code]) {
+    return UNAUTHORIZED_ERROR_MESSAGES[code];
+  }
+  if (status === 403 && FORBIDDEN_ERROR_MESSAGES[code]) {
+    return FORBIDDEN_ERROR_MESSAGES[code];
+  }
+  if (status === 423 && LOCKED_STATE_MESSAGES[code]) {
+    return LOCKED_STATE_MESSAGES[code];
+  }
+  if (status === 404 && NOT_FOUND_ERROR_MESSAGES[code]) {
+    return NOT_FOUND_ERROR_MESSAGES[code];
+  }
+  if (status >= 500 && SERVER_ERROR_MESSAGES[code]) {
+    return SERVER_ERROR_MESSAGES[code];
+  }
+
+  if (status >= 500) {
+    const fallbackMessage = STATUS_FALLBACK_MESSAGES[status] || STATUS_FALLBACK_MESSAGES[500];
+    if (code && code !== "undefined") {
+      return `${fallbackMessage} (오류 코드: ${code})`;
+    }
+    return fallbackMessage;
+  }
+
+  if (STATUS_FALLBACK_MESSAGES[status]) {
+    if (code && code !== "undefined") {
+      return `${STATUS_FALLBACK_MESSAGES[status]} (오류 코드: ${code})`;
+    }
+    return STATUS_FALLBACK_MESSAGES[status];
+  }
+
+  return error.message || "요청을 처리하지 못했습니다.";
+}
+
+function generateIdempotencyKey() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  const randomSuffix = Math.random().toString(16).slice(2).padEnd(16, "0");
+  return `fallback-${Date.now()}-${randomSuffix}`;
+}
+
+function buildTransferRequestSignature(toAccountNo, amount, memo) {
+  return `${toAccountNo}|${amount}|${memo}`;
 }
 
 function setSessionView(isSignedIn, role) {
@@ -650,15 +790,54 @@ async function doTransfer() {
   const toAccountNo = el.transferTo.value.trim();
   const amount = parseAmount(el.transferAmount.value);
   const memo = `이체 ${toAccountNo}`;
-  const data = await api("/transfer", { method: "POST", body: { toAccountNo, amount, memo } });
+  const signature = buildTransferRequestSignature(toAccountNo, amount, memo);
 
-  if (data.transaction?.status === "PENDING_APPROVAL") {
-    showToast("대량 이체 요청이 승인 대기 상태로 등록되었습니다.", false);
-  } else {
-    showToast("이체가 완료되었습니다.", false);
+  if (state.transferRequest.inFlight) {
+    if (state.transferRequest.signature === signature) {
+      showToast("이체 요청이 이미 처리 중입니다.", true);
+    }
+    return;
   }
-  await render();
-  clearInputs();
+
+  if (state.transferRequest.signature !== signature) {
+    state.transferRequest.signature = signature;
+    state.transferRequest.idempotencyKey = generateIdempotencyKey();
+  }
+
+  const idempotencyKey = state.transferRequest.idempotencyKey;
+  state.transferRequest.inFlight = true;
+  el.transferBtn.disabled = true;
+
+  try {
+    const data = await api("/transfer", {
+      method: "POST",
+      headers: {
+        "idempotency-key": idempotencyKey,
+      },
+      body: { toAccountNo, amount, memo },
+    });
+
+    state.transferRequest.signature = null;
+    state.transferRequest.idempotencyKey = null;
+
+    if (data.transaction?.status === "PENDING_APPROVAL") {
+      showToast("대량 이체 요청이 승인 대기 상태로 등록되었습니다.", false);
+    } else {
+      showToast("이체가 완료되었습니다.", false);
+    }
+
+    await render();
+    clearInputs();
+  } catch (error) {
+    if (error.status === 409 && error.code === "IDEMPOTENCY_KEY_CONFLICT") {
+      showToast(toUserMessage(error), true);
+      return;
+    }
+    throw error;
+  } finally {
+    state.transferRequest.inFlight = false;
+    el.transferBtn.disabled = false;
+  }
 }
 
 async function createAccount() {
@@ -806,7 +985,7 @@ function wrapHandler(fn) {
     try {
       await fn();
     } catch (error) {
-      showToast(error.message || "요청을 처리하지 못했습니다.", true);
+      showToast(toUserMessage(error), true);
     }
   };
 }

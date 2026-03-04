@@ -202,6 +202,7 @@
 
 ### 7.3 `POST /api/transfer`
 - Header: `x-auth-token`
+- Header (선택): `Idempotency-Key`
 - Request
 ```json
 {
@@ -219,10 +220,11 @@
   "isPendingApproval": false
 }
 ```
+- 동일 `Idempotency-Key`와 동일 요청이면 기존 이체 결과를 재사용해 중복 생성되지 않습니다.
 - Error
-  - `400` `RECEIVER_REQUIRED`
+  - `400` `RECEIVER_REQUIRED`, `BAD_IDEMPOTENCY_KEY`
   - `404` `RECEIVER_NOT_FOUND`
-  - `409` `INSUFFICIENT_FUNDS`, `SELF_TRANSFER_NOT_ALLOWED`
+  - `409` `INSUFFICIENT_FUNDS`, `SELF_TRANSFER_NOT_ALLOWED`, `IDEMPOTENCY_KEY_CONFLICT`
   - `423` `ACCOUNT_FROZEN`, `RECEIVER_FROZEN`
 
 ## 8) 관리자 전용 API
@@ -324,6 +326,7 @@
 - 상태전이: `TRANSACTION_NOT_PENDING`, `TRANSACTION_STATE_CHANGED`
 - 계좌 상태: `ACCOUNT_FROZEN`, `CANNOT_MODIFY_ADMIN_ACCOUNT`
 - 거래 상태: `INSUFFICIENT_FUNDS`, `RECEIVER_NOT_FOUND`, `SELF_TRANSFER_NOT_ALLOWED`, `REJECTED`, `FAILED`
+- 요청 멱등성: `BAD_IDEMPOTENCY_KEY`, `IDEMPOTENCY_KEY_CONFLICT`
 - 서버: `DB_ERROR`(5xx)
 
 ## 10) 요청 예시 (cURL)

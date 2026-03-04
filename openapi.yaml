@@ -292,6 +292,8 @@ paths:
       summary: 이체
       tags:
         - Transactions
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKeyHeader"
       requestBody:
         required: true
         content:
@@ -347,8 +349,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error: "RECEIVER_REQUIRED"
+              examples:
+                receiverRequired:
+                  value:
+                    error: "RECEIVER_REQUIRED"
+                badIdempotencyKey:
+                  value:
+                    error: "BAD_IDEMPOTENCY_KEY"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -372,6 +379,9 @@ paths:
                 selfTransferNotAllowed:
                   value:
                     error: "SELF_TRANSFER_NOT_ALLOWED"
+                idempotencyKeyConflict:
+                  value:
+                    error: "IDEMPOTENCY_KEY_CONFLICT"
         "423":
           description: 잠금 계좌
           content:
@@ -655,6 +665,15 @@ components:
       schema:
         type: string
       description: 계좌번호
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        maxLength: 128
+        pattern: "^[A-Za-z0-9._-]+$"
+      description: 동일 요청 재시도를 식별하기 위한 키 (선택)
     TransactionIdPath:
       name: txnId
       in: path
